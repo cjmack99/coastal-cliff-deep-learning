@@ -1,0 +1,16 @@
+name: coastal-cliff-deep-learning
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  - numpy
+  - scikit-learn
+  - matplotlib
+  - pip
+  - jupyterlab
+  - ipykernel
