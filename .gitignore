@@ -1,5 +1,102 @@
 # Byte-compiled / optimized / DLL files
-__pycache__/
+# Large LiDAR/Raster Data Files (DON'T COMMIT!)
+# ============================================
+data/raw/**
+data/processed/**
+*.tif
+*.tiff
+*.las
+*.laz
+*.h5
+*.hdf5
+*.nc
+*.nc4
+*.zarr
+
+# Retreat raster library (your 2D gridded data)
+**/retreat_rasters/**
+**/retreat_data/**
+
+# Model Files (too large for Git)
+# ============================================
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+*.pickle
+models/checkpoints/**
+models/saved_models/**
+*.weights
+*.pb
+
+# Results & Outputs (regeneratable)
+# ============================================
+results/predictions/**/*.npy
+results/predictions/**/*.tif
+results/visualizations/**/*.png
+results/visualizations/**/*.jpg
+outputs/**
+temp_outputs/**
+
+# Jupyter Notebooks
+# ============================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+
+# Large figures/videos (only commit final versions)
+# ============================================
+figures/drafts/**/*.png
+figures/drafts/**/*.jpg
+*.mp4
+*.avi
+*.mov
+*.gif
+
+# Geospatial temporary files
+# ============================================
+*.aux.xml
+*.cpg
+*.dbf
+*.prj
+*.qpj
+*.shx
+*.lock
+*.xml
+*.ovr
+
+# IDE settings (personal preferences)
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Mac files
+# ============================================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment & secrets
+# ============================================
+.env
+.env.local
+credentials.json
+*.key
+config.ini
+secrets.yaml
+
+# Temporary files
+# ============================================
+*.tmp
+*.bak
+*.log
+temp/
+tmp/
+scratch/__pycache__/
 *.py[codz]
 *$py.class
 
