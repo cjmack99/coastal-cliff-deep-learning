@@ -199,7 +199,6 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
     
     # Check if exists
     if pathout_detail.exists() and pathout_grid.exists() and not overwrite:
-        # Return a success indicator so it doesn't count as failure
         return "SKIPPED"
     
     print(f"\n--- Processing: {pathin.name} ---")
@@ -214,8 +213,14 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
         with laspy.open(pathin) as lasf:
             las = lasf.read()
         
-        print(f"  Loaded {len(las.x):,} points")
-        print(f"  LAS bounds: X=[{las.x.min():.1f}, {las.x.max():.1f}], Y=[{las.y.min():.1f}, {las.y.max():.1f}], Z=[{las.z.min():.1f}, {las.z.max():.1f}]")
+        # Access the points directly
+        points = las.points
+        x_coords = np.array(points.x)
+        y_coords = np.array(points.y)
+        z_coords = np.array(points.z)
+        
+        print(f"  Loaded {len(x_coords):,} points")
+        print(f"  LAS bounds: X=[{x_coords.min():.1f}, {x_coords.max():.1f}], Y=[{y_coords.min():.1f}, {y_coords.max():.1f}], Z=[{z_coords.min():.1f}, {z_coords.max():.1f}]")
         
         # Load polygons FIRST to get CRS
         print(f"  Loading polygons from: {polys}")
@@ -226,15 +231,15 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
         
         # Create points dataframe using the polygon CRS
         df_pts = pd.DataFrame({
-            'X': las.x,
-            'Y': las.y,
-            'Z': las.z
+            'X': x_coords,
+            'Y': y_coords,
+            'Z': z_coords
         })
         
         print(f"  Creating GeoDataFrame with CRS: {polys_gdf.crs}")
         gdf_pts = gpd.GeoDataFrame(
             df_pts,
-            geometry=[Point(x, y) for x, y in zip(las.x, las.y)],
+            geometry=[Point(x, y) for x, y in zip(x_coords, y_coords)],
             crs=polys_gdf.crs
         )
         
@@ -243,7 +248,7 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
         joined = gpd.sjoin(gdf_pts, polys_gdf[['Polygon_ID', 'geometry']],
                            how='inner', predicate='within')
         
-        print(f"  Points in polygons: {len(joined):,} / {len(las.x):,} ({100*len(joined)/len(las.x):.1f}%)")
+        print(f"  Points in polygons: {len(joined):,} / {len(x_coords):,} ({100*len(joined)/len(x_coords):.1f}%)")
         
         if len(joined) == 0:
             print("  ❌ NO POINTS IN POLYGONS!")
@@ -324,7 +329,6 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
         print(f"  Traceback:")
         traceback.print_exc()
         return None
-
 
 def process_single_file(args):
     """Wrapper for multiprocessing with better error handling."""
