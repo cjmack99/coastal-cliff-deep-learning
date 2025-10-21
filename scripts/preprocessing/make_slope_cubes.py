@@ -305,7 +305,12 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
     
     print(f"  Loaded {len(las.x):,} points")
     
-    # Create points dataframe
+    # Load polygons FIRST to get CRS
+    polys_gdf = gpd.read_file(polys)
+    polys_gdf["Polygon_ID"] = polys_gdf.index
+    print(f"  Loaded {len(polys_gdf)} polygons (CRS: {polys_gdf.crs})")
+    
+    # Create points dataframe using the polygon CRS
     df_pts = pd.DataFrame({
         'X': las.x,
         'Y': las.y,
@@ -315,12 +320,8 @@ def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False
     gdf_pts = gpd.GeoDataFrame(
         df_pts,
         geometry=[Point(x, y) for x, y in zip(las.x, las.y)],
-        crs='EPSG:2230'  # Adjust to your CRS
+        crs=polys_gdf.crs  # ← USE THE POLYGON CRS, DON'T HARDCODE
     )
-    
-    # Load polygons
-    polys_gdf = gpd.read_file(polys)
-    polys_gdf["Polygon_ID"] = polys_gdf.index
     
     # Spatial join
     joined = gpd.sjoin(gdf_pts, polys_gdf[['Polygon_ID', 'geometry']],
