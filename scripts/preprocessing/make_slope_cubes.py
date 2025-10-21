@@ -28,17 +28,11 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='pyproj')
 # Configuration
 LOCATIONS = [
     ('Blacks', 'BlacksPolygones520to567at10cm', '520', '567'),
-    ('Blacks', 'BlacksPolygons520to567at1m', '520', '567'),
-    ('DelMar', 'DelMarPolygons595to620at1m', '595', '620'),
     ('DelMar', 'DelMarPolygons595to620at10cm', '595', '620'),
     ('Encinitas', 'EncinitasPolygones708to764at10cm', '708', '764'),
-    ('Encinitas', 'EncinitasPolygons708to764at1m', '708', '764'),
     ('SanElijo', 'SanElijoPolygones684to708at10cm', '684', '708'),
-    ('SanElijo', 'SanElijoPolygons683to708at1m', '683', '708'),
     ('Solana', 'SolanaPolygones637to666at10cm', '637', '666'),
-    ('Solana', 'SolanaPolygons637to666at1m', '637', '666'),
     ('Torrey', 'TorreyPolygones568to581at10cm', '568', '581'),
-    ('Torrey', 'TorreyPolygons567to581at1m', '567', '581')
 ]
 
 # Platform-specific base paths
@@ -48,7 +42,7 @@ BASE = ("/Volumes/group/LiDAR/LidarProcessing/LidarProcessingCliffs"
 
 BASE_SHAPE_PATH = Path(os.path.join(BASE, "utilities", "shape_files"))
 BASE_LAS_PATH = Path(os.path.join(BASE, "results"))
-OUTPUT_BASE_PATH = Path(os.path.join(BASE, "results", "SlopeGrids"))
+OUTPUT_BASE_PATH = Path(os.path.join(BASE, "results", "data_cubes", "slopes"))
 
 # Processing parameters
 VERTICAL_BIN_SIZE = 0.1  # 10 cm vertical bins
