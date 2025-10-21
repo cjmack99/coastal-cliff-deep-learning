@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Create Vertical Slope Profiles from LiDAR Point Clouds
+Optimized Cliff Slope Extraction: Top-Down DEM → Vertical Transects → Slopes
 
-This script processes LAS files and creates vertical slope profiles for each polygon.
-Each polygon represents an alongshore slice, and we compute slope vertically using
-elevation bins with a moving window approach.
+Strategy:
+1. Create top-down DEM per polygon (interpolates/smooths points)
+2. Extract vertical transects (cross-shore position vs elevation)
+3. Compute local slopes from transects (matches your 10cm grid structure)
+
+This combines the speed of DEMs with the vertical profile structure you need.
 """
 
 import numpy as np
@@ -20,11 +23,10 @@ import re
 import platform
 import os
 from multiprocessing import Pool, cpu_count
-from functools import partial
+from scipy.interpolate import griddata, interp1d
+from scipy.ndimage import gaussian_filter
 import time
 
-# Suppress CRS warnings
-import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='pyproj')
 warnings.filterwarnings('ignore', category=FutureWarning, module='pyproj')
 
@@ -38,546 +40,449 @@ LOCATIONS = [
     ('Blacks', 'BlacksPolygones520to567at10cm', '520', '567')
 ]
 
-# Platform-specific base paths
+# Location-specific maximum heights (in meters)
+HEIGHTS = {
+    'DelMar': 30,
+    'SanElijo': 40,
+    'Solana': 50,
+    'Encinitas': 50,
+    'Torrey': 75,
+    'Blacks': 100
+}
+
 BASE = ("/Volumes/group/LiDAR/LidarProcessing/LidarProcessingCliffs"
         if platform.system() == "Darwin"
         else "/project/group/LiDAR/LidarProcessing/LidarProcessingCliffs")
 
 BASE_SHAPE_PATH = Path(os.path.join(BASE, "utilities", "shape_files"))
 BASE_LAS_PATH = Path(os.path.join(BASE, "results"))
-OUTPUT_BASE_PATH = Path(os.path.join(BASE, "results", "data_cubes", "slopes"))
+OUTPUT_BASE_PATH = Path(os.path.join(BASE, "results", "data_cubes", "slopes_optimized"))
 
 # Processing parameters
-VERTICAL_BIN_SIZE = 0.1  # 10 cm vertical bins
-MAX_HEIGHT = 30.0  # maximum height to consider
-WINDOW_SIZE = 3  # number of bins for moving window (centered)
-MIN_POINTS_PER_BIN = 5  # minimum points needed in a bin
+DEM_RESOLUTION = 0.25        # Top-down DEM resolution (m) - fine enough to capture cliff detail
+ELEVATION_BIN_SIZE = 0.1     # Vertical bins (10 cm) - MATCHES YOUR EXISTING GRIDS
+MIN_POINTS_FOR_DEM = 50      # Minimum points needed per polygon
+SMOOTH_SIGMA = 0.5           # Gaussian smoothing for DEM (reduces noise)
+SLOPE_WINDOW = 5             # Window size for slope calculation (in 10cm bins)
 
-# Compute number of processes to use
 N_CORES = cpu_count()
 N_PROCESSES = max(1, N_CORES // 4)
 
 
-def compute_vertical_slope(z_centers, z_values, window_size=3):
+def create_topdown_dem(points_df, polygon_geom, resolution=DEM_RESOLUTION):
     """
-    Compute slope at each vertical bin using a moving window.
+    Step 1: Create traditional top-down DEM from points within polygon.
+    
+    Benefits:
+    - Interpolates gaps
+    - Smooths noise
+    - Creates continuous surface
     
     Args:
-        z_centers: Array of bin center elevations
-        z_values: Array of mean elevations in each bin
-        window_size: Number of bins to use in window (must be odd)
+        points_df: DataFrame with X, Y, Z
+        polygon_geom: Shapely polygon
+        resolution: Grid cell size (m)
     
     Returns:
-        Array of slope values (same length as z_centers)
+        dem: 2D elevation array
+        extent: (xmin, xmax, ymin, ymax)
+        x_coords: 1D array of X coordinates
+        y_coords: 1D array of Y coordinates
     """
-    n = len(z_centers)
-    slopes = np.full(n, np.nan)
+    if len(points_df) < MIN_POINTS_FOR_DEM:
+        return None, None, None, None
     
-    half_window = window_size // 2
+    # Get polygon bounds
+    xmin, ymin, xmax, ymax = polygon_geom.bounds
     
-    for i in range(n):
-        # Get window indices
-        start_idx = max(0, i - half_window)
-        end_idx = min(n, i + half_window + 1)
-        
-        # Need at least 2 points to compute slope
-        if end_idx - start_idx < 2:
-            continue
-        
-        # Get window data
-        z_win = z_centers[start_idx:end_idx]
-        val_win = z_values[start_idx:end_idx]
-        
-        # Remove NaN values
-        valid = ~np.isnan(val_win)
-        if np.sum(valid) < 2:
-            continue
-        
-        z_win = z_win[valid]
-        val_win = val_win[valid]
-        
-        # Fit linear slope: dz/dh (change in position per change in height)
-        # Using polyfit for simple linear regression
-        if len(z_win) >= 2:
-            coeffs = np.polyfit(z_win, val_win, 1)
-            slopes[i] = abs(coeffs[0])  # slope magnitude
+    # Create regular grid
+    x_coords = np.arange(xmin, xmax + resolution, resolution)
+    y_coords = np.arange(ymin, ymax + resolution, resolution)
+    grid_x, grid_y = np.meshgrid(x_coords, y_coords)
     
-    return slopes
+    # Interpolate points to grid
+    points = points_df[['X', 'Y']].values
+    values = points_df['Z'].values
+    
+    # Use linear interpolation (fast, good for dense LiDAR)
+    dem = griddata(points, values, (grid_x, grid_y), method='linear')
+    
+    # Optional: smooth to reduce noise (helps slope calculation)
+    if SMOOTH_SIGMA > 0:
+        valid_mask = ~np.isnan(dem)
+        if valid_mask.any():
+            dem_smooth = gaussian_filter(np.nan_to_num(dem, nan=0.0), sigma=SMOOTH_SIGMA)
+            dem = np.where(valid_mask, dem_smooth, np.nan)
+    
+    return dem, (xmin, xmax, ymin, ymax), x_coords, y_coords
 
 
-def makeGrid_with_slope(pathin, pathout_slope, polys, 
-                        vertical_bin_size=VERTICAL_BIN_SIZE,
-                        max_height=MAX_HEIGHT,
-                        window_size=WINDOW_SIZE,
-                        overwrite=False):
+def extract_vertical_transect(dem, x_coords, y_coords, elevation_bins):
     """
-    Reads in a LAS file and a shapefile of polygons, calculates vertical slope profile
-    for each polygon using elevation bins with a moving window.
+    Step 2: Extract vertical transect from DEM.
+    
+    For each elevation bin, find the mean cross-shore position (X coordinate)
+    where the DEM has that elevation. This is averaged across the Y dimension
+    (alongshore) within the polygon.
+    
+    This matches your existing cube structure: one value per elevation bin per polygon.
     
     Args:
-        pathin: Path to input LAS file
-        pathout_slope: Path to output CSV file for slope data
-        polys: Path to shapefile with polygons
-        vertical_bin_size: Size of vertical bins (default 0.1 m)
-        max_height: Maximum height to consider (default 30 m)
-        window_size: Number of bins for moving window (default 3)
-        overwrite: Whether to overwrite existing files
-    """
+        dem: 2D elevation array (rows=Y, cols=X)
+        x_coords: 1D array of X coordinates
+        y_coords: 1D array of Y coordinates  
+        elevation_bins: 1D array of elevation bin centers (e.g., [0.05, 0.15, 0.25, ...])
     
-    # Check if output exists and skip if not overwriting
-    if Path(pathout_slope).exists() and not overwrite:
-        print(f"Output exists, skipping: {pathout_slope}")
+    Returns:
+        transect_df: DataFrame with columns [z_bin, mean_x, std_x, n_cells]
+    """
+    if dem is None:
+        return None
+    
+    # For each elevation bin, find which cells have that elevation
+    results = []
+    
+    for z_center in elevation_bins:
+        # Find cells within ±half bin of this elevation
+        half_bin = ELEVATION_BIN_SIZE / 2
+        mask = (dem >= z_center - half_bin) & (dem < z_center + half_bin)
+        
+        if not mask.any():
+            continue
+        
+        # Get X coordinates of cells at this elevation
+        # Since dem is (rows, cols) and rows=Y, cols=X:
+        row_indices, col_indices = np.where(mask)
+        x_values = x_coords[col_indices]
+        
+        n_cells = len(x_values)
+        
+        if n_cells >= 3:  # Need minimum number of cells
+            results.append({
+                'z_bin': z_center,
+                'mean_x': np.mean(x_values),
+                'std_x': np.std(x_values),
+                'n_cells': n_cells
+            })
+    
+    if results:
+        return pd.DataFrame(results)
+    return None
+
+
+def compute_slopes_from_transect(transect_df, window_size=SLOPE_WINDOW):
+    """
+    Step 3: Compute local slopes from vertical transect.
+    
+    Slope = dX/dZ (cross-shore distance change per elevation change)
+    Then convert to angle: slope_angle = arctan(1/slope) since we want dZ/dX
+    
+    Uses moving window to compute slope at each elevation.
+    
+    Args:
+        transect_df: DataFrame with z_bin, mean_x columns
+        window_size: Number of bins for moving window (should be odd)
+    
+    Returns:
+        transect_df with added columns: slope_magnitude, slope_angle_deg
+    """
+    if transect_df is None or len(transect_df) < 2:
+        return None
+    
+    z_bins = transect_df['z_bin'].values
+    x_values = transect_df['mean_x'].values
+    
+    slopes = np.full(len(z_bins), np.nan)
+    half_window = window_size // 2
+    
+    for i in range(len(z_bins)):
+        # Get window
+        start_idx = max(0, i - half_window)
+        end_idx = min(len(z_bins), i + half_window + 1)
+        
+        if end_idx - start_idx < 3:  # Need at least 3 points
+            continue
+        
+        z_window = z_bins[start_idx:end_idx]
+        x_window = x_values[start_idx:end_idx]
+        
+        # Fit linear slope: x = a*z + b, so dX/dZ = a
+        if len(z_window) >= 2:
+            coeffs = np.polyfit(z_window, x_window, 1)
+            dx_dz = coeffs[0]  # Rate of cross-shore change per elevation
+            
+            # Convert to cliff face slope (dZ/dX)
+            if abs(dx_dz) > 1e-6:  # Avoid division by zero
+                dz_dx = 1.0 / dx_dz
+                slopes[i] = abs(dz_dx)  # Magnitude of slope
+    
+    # Add to dataframe
+    transect_df = transect_df.copy()
+    transect_df['slope_magnitude'] = slopes
+    transect_df['slope_angle_deg'] = np.degrees(np.arctan(slopes))
+    
+    return transect_df
+
+
+def process_polygon(points_df, polygon_geom, polygon_id, max_height):
+    """
+    Complete processing pipeline for one polygon:
+    1. Create top-down DEM
+    2. Extract vertical transect
+    3. Compute slopes
+    
+    Args:
+        points_df: DataFrame with X, Y, Z
+        polygon_geom: Shapely polygon geometry
+        polygon_id: Polygon identifier
+        max_height: Maximum elevation for this location
+    
+    Returns:
+        DataFrame with columns: polygon_id, z_bin, mean_x, slope_magnitude, slope_angle_deg, n_cells
+    """
+    # Step 1: Create DEM
+    dem, extent, x_coords, y_coords = create_topdown_dem(points_df, polygon_geom)
+    
+    if dem is None:
+        return None
+    
+    # Step 2: Define elevation bins (matching your 10cm structure)
+    # Use location-specific max_height
+    elevation_bins = np.arange(ELEVATION_BIN_SIZE/2, max_height, ELEVATION_BIN_SIZE)
+    
+    # Extract transect
+    transect_df = extract_vertical_transect(dem, x_coords, y_coords, elevation_bins)
+    
+    if transect_df is None:
+        return None
+    
+    # Step 3: Compute slopes
+    transect_df = compute_slopes_from_transect(transect_df)
+    
+    if transect_df is None:
+        return None
+    
+    # Add polygon ID
+    transect_df['polygon_id'] = polygon_id
+    
+    return transect_df
+
+
+def process_las_file(pathin, pathout_base, polys, location_name, overwrite=False):
+    """
+    Process entire LAS file for all polygons.
+    
+    Args:
+        pathin: Path to LAS file
+        pathout_base: Base path for outputs
+        polys: Path to polygon shapefile
+        location_name: Location name (e.g., 'DelMar') - used to get max_height
+        overwrite: Whether to overwrite existing files
+    
+    Outputs:
+    - *_slopes.csv: Detailed data (polygon_id, z_bin, slope values)
+    - *_slopes_grid.csv: Grid format matching your cubes (rows=polygons, cols=z_bins)
+    - *_summary.csv: Per-polygon statistics
+    """
+    pathout_detail = Path(str(pathout_base) + '_slopes.csv')
+    pathout_grid = Path(str(pathout_base) + '_slopes_grid.csv')
+    pathout_summary = Path(str(pathout_base) + '_summary.csv')
+    
+    # Check if exists
+    if pathout_detail.exists() and pathout_grid.exists() and not overwrite:
+        print(f"Outputs exist, skipping: {pathout_base.name}")
         return
     
-    print(f"\n--- Processing LAS: {pathin} ---")
+    print(f"\n--- Processing: {pathin.name} ---")
     
-    # Read LAS file
+    # Get max height for this location
+    max_height = HEIGHTS.get(location_name, 30)  # Default to 30 if not found
+    print(f"  Max height: {max_height}m")
+    
+    # Read LAS
     with laspy.open(pathin) as lasf:
         las = lasf.read()
     
-    print(f"Loaded {len(las.x):,} points")
+    print(f"  Loaded {len(las.x):,} points")
     
-    # Stack arrays (X, Y, Z)
-    arr = np.vstack((las.x, las.y, las.z)).T
+    # Create points dataframe
+    df_pts = pd.DataFrame({
+        'X': las.x,
+        'Y': las.y,
+        'Z': las.z
+    })
+    
+    gdf_pts = gpd.GeoDataFrame(
+        df_pts,
+        geometry=[Point(x, y) for x, y in zip(las.x, las.y)],
+        crs='EPSG:2230'  # Adjust to your CRS
+    )
     
     # Load polygons
     polys_gdf = gpd.read_file(polys)
     polys_gdf["Polygon_ID"] = polys_gdf.index
-    print(f"Loaded {len(polys_gdf)} polygons (alongshore slices)")
     
-    # Create points GeoDataFrame
-    df_pts = pd.DataFrame(arr, columns=['X', 'Y', 'Z'])
-    gdf_pts = gpd.GeoDataFrame(
-        df_pts,
-        geometry=[Point(x, y) for x, y in zip(arr[:, 0], arr[:, 1])],
-        crs=polys_gdf.crs
-    )
-    
-    # Spatial join to assign each point to a polygon
-    print("Performing spatial join...")
+    # Spatial join
     joined = gpd.sjoin(gdf_pts, polys_gdf[['Polygon_ID', 'geometry']],
                        how='inner', predicate='within')
     
-    print(f"{len(joined):,} points within polygons")
-    
     if len(joined) == 0:
-        print("No points within polygons, skipping...")
+        print("  No points in polygons, skipping")
         return None
     
-    # Create vertical bins
-    z_bin_edges = np.arange(0, max_height + vertical_bin_size, vertical_bin_size)
-    z_bin_centers = z_bin_edges[:-1] + vertical_bin_size / 2
-    
-    print(f"Computing vertical slope profiles with {window_size}-bin moving window...")
-    print(f"Using {len(z_bin_centers)} vertical bins from 0 to {max_height} m")
-    
-    results = []
+    print(f"  {len(joined):,} points in {len(polys_gdf)} polygons")
     
     # Process each polygon
-    for poly_id in tqdm(range(len(polys_gdf)), desc="Processing polygons"):
-        # Get points in this polygon
+    all_results = []
+    
+    for poly_id in tqdm(range(len(polys_gdf)), desc="  Polygons", leave=False):
         poly_points = joined[joined['Polygon_ID'] == poly_id]
         
-        if len(poly_points) < MIN_POINTS_PER_BIN:
+        if len(poly_points) < MIN_POINTS_FOR_DEM:
             continue
         
-        # Bin points by elevation
-        z_values = poly_points['Z'].values
-        x_values = poly_points['X'].values
-        y_values = poly_points['Y'].values
+        poly_geom = polys_gdf.iloc[poly_id].geometry
         
-        # For each vertical bin, compute mean cross-shore position (X)
-        bin_indices = np.digitize(z_values, z_bin_edges) - 1
+        result = process_polygon(poly_points, poly_geom, poly_id, max_height)
         
-        # Calculate mean X position for each bin
-        mean_x_per_bin = np.full(len(z_bin_centers), np.nan)
-        points_per_bin = np.zeros(len(z_bin_centers), dtype=int)
-        
-        for i in range(len(z_bin_centers)):
-            mask = bin_indices == i
-            if np.sum(mask) >= MIN_POINTS_PER_BIN:
-                mean_x_per_bin[i] = np.mean(x_values[mask])
-                points_per_bin[i] = np.sum(mask)
-        
-        # Compute slope using moving window
-        slopes = compute_vertical_slope(z_bin_centers, mean_x_per_bin, window_size)
-        
-        # Store results for each bin with valid slope
-        for i, (z_center, slope, mean_x, n_pts) in enumerate(
-            zip(z_bin_centers, slopes, mean_x_per_bin, points_per_bin)
-        ):
-            if not np.isnan(slope) and n_pts >= MIN_POINTS_PER_BIN:
-                results.append({
-                    'Polygon_ID': poly_id,
-                    'z_bin': z_center,
-                    'slope_magnitude': slope,
-                    'slope_angle_deg': np.degrees(np.arctan(slope)),
-                    'mean_x': mean_x,
-                    'n_points': n_pts
-                })
+        if result is not None:
+            all_results.append(result)
     
-    # Convert to DataFrame and save
-    if results:
-        df_results = pd.DataFrame(results)
-        
-        # Ensure output directory exists
-        Path(pathout_slope).parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save detailed CSV
-        df_results.to_csv(pathout_slope, index=False)
-        print(f"\nSaved slope data to: {pathout_slope}")
-        print(f"Computed slopes for {len(df_results)} polygon-bin combinations")
-        
-        # Also save as a grid (pivot table) to match your cube format
-        grid_file = pathout_slope.with_name(pathout_slope.stem + '_grid.csv')
-        slope_grid = df_results.pivot(index='Polygon_ID', columns='z_bin', values='slope_magnitude')
-        slope_grid.to_csv(grid_file)
-        print(f"Saved gridded format to: {grid_file}")
-        print(f"Grid shape: {slope_grid.shape} (rows=polygons, cols=elevation bins)")
-        
-        # Print summary statistics
-        print("\nSlope Statistics:")
-        print(f"  Mean slope magnitude: {df_results['slope_magnitude'].mean():.3f}")
-        print(f"  Median slope magnitude: {df_results['slope_magnitude'].median():.3f}")
-        print(f"  Max slope magnitude: {df_results['slope_magnitude'].max():.3f}")
-        print(f"  Mean slope angle: {df_results['slope_angle_deg'].mean():.1f}°")
-        
-        return df_results
-    else:
-        print("\nNo valid slopes computed (insufficient points in bins)")
+    if not all_results:
+        print("  No valid results")
         return None
-
-
-def create_slope_visualization(df_results, polys_gdf, output_file, location_name, date_str):
-    """
-    Create visualization of vertical slope profiles.
-    """
-    if df_results is None or len(df_results) == 0:
-        return
     
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    # Concatenate all results
+    df_all = pd.concat(all_results, ignore_index=True)
     
-    # Plot 1: Example vertical profiles for a few polygons
-    unique_polys = df_results['Polygon_ID'].unique()
-    n_profiles = min(10, len(unique_polys))
-    sample_polys = np.random.choice(unique_polys, n_profiles, replace=False)
+    # Ensure output directory exists
+    pathout_detail.parent.mkdir(parents=True, exist_ok=True)
     
-    colors = plt.cm.viridis(np.linspace(0, 1, n_profiles))
+    # Save detailed format
+    df_all.to_csv(pathout_detail, index=False)
     
-    for i, poly_id in enumerate(sample_polys):
-        poly_data = df_results[df_results['Polygon_ID'] == poly_id].sort_values('z_bin')
-        ax1.plot(poly_data['slope_magnitude'], poly_data['z_bin'], 
-                'o-', color=colors[i], alpha=0.7, linewidth=2, markersize=4,
-                label=f'Polygon {poly_id}')
+    # Create grid format (MATCHES YOUR CUBE STRUCTURE)
+    slope_grid = df_all.pivot(
+        index='polygon_id',
+        columns='z_bin',
+        values='slope_angle_deg'
+    )
+    slope_grid.to_csv(pathout_grid)
     
-    ax1.set_xlabel('Slope Magnitude', fontsize=12)
-    ax1.set_ylabel('Elevation (m)', fontsize=12)
-    ax1.set_title(f'Example Vertical Slope Profiles\n(n={n_profiles} polygons)', 
-                 fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(fontsize=8, ncol=2)
+    # Create summary statistics per polygon
+    summary = df_all.groupby('polygon_id').agg({
+        'slope_angle_deg': ['mean', 'median', 'std', 'max'],
+        'n_cells': 'sum'
+    }).reset_index()
+    summary.columns = ['polygon_id', 'mean_slope', 'median_slope', 'std_slope', 'max_slope', 'total_cells']
+    summary.to_csv(pathout_summary, index=False)
     
-    # Plot 2: Mean slope by elevation across all polygons
-    mean_slope_by_z = df_results.groupby('z_bin')['slope_magnitude'].agg(['mean', 'std', 'count'])
-    mean_slope_by_z = mean_slope_by_z[mean_slope_by_z['count'] >= 5]  # Only bins with enough data
+    print(f"  ✓ Saved {len(df_all)} records from {len(all_results)} polygons")
+    print(f"  ✓ Grid shape: {slope_grid.shape}")
+    print(f"  ✓ Mean slope: {df_all['slope_angle_deg'].mean():.1f}°")
     
-    ax2.errorbar(mean_slope_by_z['mean'], mean_slope_by_z.index, 
-                xerr=mean_slope_by_z['std'], fmt='o-', color='red', 
-                linewidth=2, markersize=6, capsize=5, alpha=0.7)
-    ax2.set_xlabel('Mean Slope Magnitude', fontsize=12)
-    ax2.set_ylabel('Elevation (m)', fontsize=12)
-    ax2.set_title(f'Mean Slope Profile (All Polygons)\n(n={len(unique_polys)} polygons)', 
-                 fontsize=14, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    
-    fig.suptitle(f'Vertical Slope Analysis\n{location_name} - {date_str}',
-                fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved visualization to: {output_file}")
+    return df_all
 
 
 def process_single_file(args):
-    """
-    Process a single LAS file. This function is designed to be called by multiprocessing.
-    
-    Args:
-        args: tuple containing (las_file, shp_path, location_name, polygon_name, overwrite)
-    
-    Returns:
-        tuple: (success, file_name, message)
-    """
+    """Wrapper for multiprocessing."""
     las_file, shp_path, location_name, polygon_name, overwrite = args
     
     try:
-        # Extract date from filename
         date_match = re.match(r'^\d{8}', las_file.stem)
         date_str = date_match.group() if date_match else 'unknown'
         
-        # Create output paths
         output_folder = OUTPUT_BASE_PATH / location_name / polygon_name
-        output_folder.mkdir(parents=True, exist_ok=True)
+        pathout_base = output_folder / f"{date_str}_{polygon_name}"
         
-        pathout_slope = output_folder / f"{date_str}_{polygon_name}_slopes.csv"
-        fig_file = output_folder / f"{date_str}_{polygon_name}_slopes.png"
+        result = process_las_file(las_file, pathout_base, shp_path, location_name, overwrite)
         
-        # Process the file
-        df_results = makeGrid_with_slope(
-            pathin=las_file,
-            pathout_slope=pathout_slope,
-            polys=shp_path,
-            vertical_bin_size=VERTICAL_BIN_SIZE,
-            max_height=MAX_HEIGHT,
-            window_size=WINDOW_SIZE,
-            overwrite=overwrite
-        )
-        
-        # Create visualization if we got results
-        if df_results is not None and len(df_results) > 0:
-            # Load polygons for visualization
-            polys_gdf = gpd.read_file(shp_path)
-            polys_gdf["Polygon_ID"] = polys_gdf.index
-            
-            create_slope_visualization(df_results, polys_gdf, fig_file, 
-                                     location_name, date_str)
-        
-        return (True, las_file.name, f"Successfully processed {len(df_results) if df_results is not None else 0} polygon-bin combinations")
+        if result is not None:
+            return (True, las_file.name, f"Processed {len(result['polygon_id'].unique())} polygons")
+        return (False, las_file.name, "No valid data")
         
     except Exception as e:
-        error_msg = f"Error processing {las_file.name}: {str(e)}"
-        return (False, las_file.name, error_msg)
+        return (False, las_file.name, f"Error: {str(e)}")
 
 
 def process_location(location_name, polygon_name, start_mop, end_mop, overwrite=False):
-    """Process all LAS files for a single location using multiprocessing."""
+    """Process all LAS files for a location."""
+    # Get max height for this location
+    max_height = HEIGHTS.get(location_name, 30)
+    
     print(f"\n{'='*70}")
-    print(f"Processing: {location_name} - {polygon_name}")
-    print(f"Using {N_PROCESSES} processes ({N_CORES} cores available)")
+    print(f"Processing: {location_name}")
+    print(f"  Max height: {max_height}m")
+    print(f"  DEM resolution: {DEM_RESOLUTION}m")
+    print(f"  Elevation bins: {ELEVATION_BIN_SIZE}m (10cm)")
+    print(f"  Slope window: {SLOPE_WINDOW} bins")
+    print(f"  Using {N_PROCESSES} processes")
     print(f"{'='*70}")
     
-    # Construct shapefile path
     shp_path = BASE_SHAPE_PATH / polygon_name / f"{polygon_name}.shp"
     
     if not shp_path.exists():
-        warnings.warn(f"Shapefile not found: {shp_path}\nSkipping...")
+        print(f"  ⚠️  Shapefile not found: {shp_path}")
         return
     
-    # Find all LAS files for this location
     las_folder = BASE_LAS_PATH / location_name / 'noveg'
     
     if not las_folder.exists():
-        warnings.warn(f"LAS folder not found: {las_folder}\nSkipping...")
+        print(f"  ⚠️  LAS folder not found: {las_folder}")
         return
     
     las_files = sorted(las_folder.glob('*noveg.las'))
     
     if not las_files:
-        warnings.warn(f"No LAS files found in: {las_folder}\nSkipping...")
+        print(f"  ⚠️  No LAS files found")
         return
     
-    print(f"Found {len(las_files)} LAS files to process")
+    print(f"  Found {len(las_files)} LAS files\n")
     
-    # Prepare arguments for multiprocessing
-    args_list = [(las_file, shp_path, location_name, polygon_name, overwrite) 
+    args_list = [(las_file, shp_path, location_name, polygon_name, overwrite)
                  for las_file in las_files]
     
-    # Process files in parallel
     start_time = time.time()
     
     with Pool(processes=N_PROCESSES) as pool:
-        # Use imap for progress tracking
         results = list(tqdm(
             pool.imap(process_single_file, args_list),
             total=len(args_list),
-            desc=f"Processing {location_name} files"
+            desc=f"  {location_name}"
         ))
     
-    end_time = time.time()
-    processing_time = end_time - start_time
+    elapsed = time.time() - start_time
     
-    # Summarize results
-    successful = [r for r in results if r[0]]
-    failed = [r for r in results if not r[0]]
+    successful = sum(1 for r in results if r[0])
     
-    print(f"\n{'='*70}")
-    print(f"LOCATION PROCESSING COMPLETE: {location_name}")
-    print(f"{'='*70}")
-    print(f"Total processing time: {processing_time:.1f} seconds")
-    print(f"Average time per file: {processing_time/len(las_files):.1f} seconds")
-    print(f"Successfully processed: {len(successful)}/{len(las_files)} files")
-    
-    if failed:
-        print(f"\nFailed files ({len(failed)}):")
-        for success, filename, message in failed:
-            print(f"  ❌ {filename}: {message}")
-    
-    if successful:
-        print(f"\nSuccessful files ({len(successful)}):")
-        for success, filename, message in successful[:5]:  # Show first 5
-            print(f"  ✅ {filename}: {message}")
-        if len(successful) > 5:
-            print(f"  ... and {len(successful) - 5} more")
-    
-    print(f"\nCompleted processing for {location_name} - {polygon_name}")
-
-
-def load_slope_data(location, polygon_name, date_str, base_path=None, as_grid=False):
-    """
-    Load slope data for a specific location, polygon, and date.
-    
-    Args:
-        location: Location name (e.g., 'DelMar')
-        polygon_name: Polygon identifier (e.g., 'DelMarPolygons595to620at10cm')
-        date_str: Date string (e.g., '20170323')
-        base_path: Base path to slope grids (optional)
-        as_grid: If True, load the grid format; if False, load detailed format
-    
-    Returns:
-        pd.DataFrame: DataFrame with slope data (grid or detailed format)
-    """
-    if base_path is None:
-        base_path = OUTPUT_BASE_PATH
-    else:
-        base_path = Path(base_path)
-    
-    if as_grid:
-        file_path = base_path / location / polygon_name / f"{date_str}_{polygon_name}_slopes_grid.csv"
-    else:
-        file_path = base_path / location / polygon_name / f"{date_str}_{polygon_name}_slopes.csv"
-    
-    if not file_path.exists():
-        raise FileNotFoundError(f"Slope data file not found: {file_path}")
-    
-    return pd.read_csv(file_path, index_col=0 if as_grid else None)
-
-
-def find_slope_grid_files(location, polygon_name, base_path=None):
-    """
-    Find all slope grid files for a location, similar to find_csv_files().
-    Returns a sorted list of paths to all *_slopes_grid.csv files.
-    
-    Args:
-        location: Location name (e.g., 'DelMar')
-        polygon_name: Polygon identifier (e.g., 'DelMarPolygons595to620at10cm')
-        base_path: Base path to slope grids (optional)
-    
-    Returns:
-        list: Sorted list of file paths
-    """
-    if base_path is None:
-        base_path = OUTPUT_BASE_PATH
-    else:
-        base_path = Path(base_path)
-    
-    folder = base_path / location / polygon_name
-    
-    if not folder.exists():
-        return []
-    
-    # Find all grid files
-    grid_files = sorted(folder.glob("*_slopes_grid.csv"))
-    
-    # Extract dates and sort
-    date_re = re.compile(r'(\d{8})')
-    dated_files = []
-    for fp in grid_files:
-        m = date_re.search(fp.name)
-        if m:
-            dated_files.append((m.group(1), str(fp)))
-    
-    dated_files.sort(key=lambda x: x[0])
-    return [path for (_, path) in dated_files]
-
-
-def load_slope_cube(location, polygon_name, base_path=None):
-    """
-    Load slope grids into a 3D NumPy array matching your cube format.
-    
-    Args:
-        location: Location name (e.g., 'DelMar')
-        polygon_name: Polygon identifier (e.g., 'DelMarPolygons595to620at10cm')
-        base_path: Base path to slope grids (optional)
-    
-    Returns:
-        tuple: (slope_cube, file_list) where slope_cube has shape (n_dates, n_polygons, n_z_bins)
-    """
-    file_list = find_slope_grid_files(location, polygon_name, base_path)
-    
-    if not file_list:
-        raise ValueError(f"No slope grid files found for {location}/{polygon_name}")
-    
-    grids = []
-    valid_files = []
-    shapes = []
-    
-    for fp in file_list:
-        df = pd.read_csv(fp, index_col=0)
-        grids.append(df.values)
-        shapes.append((fp, df.shape))
-        valid_files.append(fp)
-    
-    if not grids:
-        raise ValueError("No valid slope grid files found.")
-    
-    # Get reference shape
-    ref_shape = shapes[0][1]
-    
-    # Filter out mismatched grids
-    valid_grids = []
-    valid_files_final = []
-    mismatches = []
-    
-    for i, (fp, shape) in enumerate(shapes):
-        if shape == ref_shape:
-            valid_grids.append(grids[i])
-            valid_files_final.append(fp)
-        else:
-            mismatches.append((fp, shape))
-    
-    if mismatches:
-        print(f"\n⚠️ Omitting {len(mismatches)} files with mismatched grid shapes:")
-        for fp, shape in mismatches:
-            print(f"  {os.path.basename(fp)} — shape = {shape}, expected = {ref_shape}")
-        print(f"\n✅ Using {len(valid_grids)} files with consistent shape {ref_shape}")
-    
-    if not valid_grids:
-        raise ValueError("No files have consistent grid shapes.")
-    
-    slope_cube = np.stack(valid_grids, axis=0)
-    print(f"Slope cube shape: {slope_cube.shape} (dates, polygons, elevation_bins)")
-    
-    return slope_cube, valid_files_final
+    print(f"\n  Completed in {elapsed:.1f}s ({elapsed/len(las_files):.1f}s per file)")
+    print(f"  Success: {successful}/{len(las_files)} files")
 
 
 def main():
     """Main processing function."""
+    print("\n" + "="*70)
+    print("OPTIMIZED CLIFF SLOPE EXTRACTION")
+    print("Strategy: Top-Down DEM → Vertical Transect → Slopes")
     print("="*70)
-    print("LiDAR Vertical Slope Profile Generator")
+    print(f"DEM Resolution: {DEM_RESOLUTION}m")
+    print(f"Elevation Bins: {ELEVATION_BIN_SIZE}m (matches your existing grids)")
+    print(f"Output Format: Grid (polygons × elevation_bins)")
+    print(f"CPU Cores: {N_CORES}, Using: {N_PROCESSES} processes")
+    print("\nLocation-specific heights:")
+    for loc, height in sorted(HEIGHTS.items()):
+        print(f"  {loc}: {height}m")
     print("="*70)
-    print(f"Platform: {platform.system()}")
-    print(f"Base path: {BASE}")
-    print(f"Vertical bin size: {VERTICAL_BIN_SIZE} m")
-    print(f"Moving window size: {WINDOW_SIZE} bins")
-    print(f"Minimum points per bin: {MIN_POINTS_PER_BIN}")
-    print(f"CPU cores available: {N_CORES}")
-    print(f"Processes to use: {N_PROCESSES} (cores // 4)")
     
-    overall_start_time = time.time()
+    overall_start = time.time()
     
-    # Process each location
     for location_name, polygon_name, start_mop, end_mop in LOCATIONS:
         process_location(location_name, polygon_name, start_mop, end_mop, overwrite=False)
     
-    overall_end_time = time.time()
-    total_time = overall_end_time - overall_start_time
+    total_time = time.time() - overall_start
     
     print("\n" + "="*70)
-    print("ALL LOCATIONS PROCESSED!")
-    print("="*70)
-    print(f"Total processing time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
-    print(f"Processed {len(LOCATIONS)} locations using {N_PROCESSES} parallel processes")
+    print(f"ALL COMPLETE! Total: {total_time/60:.1f} minutes")
     print("="*70)
 
 
