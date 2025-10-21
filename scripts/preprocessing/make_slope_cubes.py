@@ -19,6 +19,9 @@ import warnings
 import re
 import platform
 import os
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
 
 # Suppress CRS warnings
 import warnings
@@ -27,12 +30,12 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='pyproj')
 
 # Configuration
 LOCATIONS = [
-    ('Blacks', 'BlacksPolygones520to567at10cm', '520', '567'),
     ('DelMar', 'DelMarPolygons595to620at10cm', '595', '620'),
     ('Encinitas', 'EncinitasPolygones708to764at10cm', '708', '764'),
     ('SanElijo', 'SanElijoPolygones684to708at10cm', '684', '708'),
     ('Solana', 'SolanaPolygones637to666at10cm', '637', '666'),
     ('Torrey', 'TorreyPolygones568to581at10cm', '568', '581'),
+    ('Blacks', 'BlacksPolygones520to567at10cm', '520', '567')
 ]
 
 # Platform-specific base paths
@@ -49,6 +52,10 @@ VERTICAL_BIN_SIZE = 0.1  # 10 cm vertical bins
 MAX_HEIGHT = 30.0  # maximum height to consider
 WINDOW_SIZE = 3  # number of bins for moving window (centered)
 MIN_POINTS_PER_BIN = 5  # minimum points needed in a bin
+
+# Compute number of processes to use
+N_CORES = cpu_count()
+N_PROCESSES = max(1, N_CORES // 4)
 
 
 def compute_vertical_slope(z_centers, z_values, window_size=3):
@@ -292,10 +299,62 @@ def create_slope_visualization(df_results, polys_gdf, output_file, location_name
     print(f"Saved visualization to: {output_file}")
 
 
+def process_single_file(args):
+    """
+    Process a single LAS file. This function is designed to be called by multiprocessing.
+    
+    Args:
+        args: tuple containing (las_file, shp_path, location_name, polygon_name, overwrite)
+    
+    Returns:
+        tuple: (success, file_name, message)
+    """
+    las_file, shp_path, location_name, polygon_name, overwrite = args
+    
+    try:
+        # Extract date from filename
+        date_match = re.match(r'^\d{8}', las_file.stem)
+        date_str = date_match.group() if date_match else 'unknown'
+        
+        # Create output paths
+        output_folder = OUTPUT_BASE_PATH / location_name / polygon_name
+        output_folder.mkdir(parents=True, exist_ok=True)
+        
+        pathout_slope = output_folder / f"{date_str}_{polygon_name}_slopes.csv"
+        fig_file = output_folder / f"{date_str}_{polygon_name}_slopes.png"
+        
+        # Process the file
+        df_results = makeGrid_with_slope(
+            pathin=las_file,
+            pathout_slope=pathout_slope,
+            polys=shp_path,
+            vertical_bin_size=VERTICAL_BIN_SIZE,
+            max_height=MAX_HEIGHT,
+            window_size=WINDOW_SIZE,
+            overwrite=overwrite
+        )
+        
+        # Create visualization if we got results
+        if df_results is not None and len(df_results) > 0:
+            # Load polygons for visualization
+            polys_gdf = gpd.read_file(shp_path)
+            polys_gdf["Polygon_ID"] = polys_gdf.index
+            
+            create_slope_visualization(df_results, polys_gdf, fig_file, 
+                                     location_name, date_str)
+        
+        return (True, las_file.name, f"Successfully processed {len(df_results) if df_results is not None else 0} polygon-bin combinations")
+        
+    except Exception as e:
+        error_msg = f"Error processing {las_file.name}: {str(e)}"
+        return (False, las_file.name, error_msg)
+
+
 def process_location(location_name, polygon_name, start_mop, end_mop, overwrite=False):
-    """Process all LAS files for a single location."""
+    """Process all LAS files for a single location using multiprocessing."""
     print(f"\n{'='*70}")
     print(f"Processing: {location_name} - {polygon_name}")
+    print(f"Using {N_PROCESSES} processes ({N_CORES} cores available)")
     print(f"{'='*70}")
     
     # Construct shapefile path
@@ -304,10 +363,6 @@ def process_location(location_name, polygon_name, start_mop, end_mop, overwrite=
     if not shp_path.exists():
         warnings.warn(f"Shapefile not found: {shp_path}\nSkipping...")
         return
-    
-    # Load polygons (for visualization later)
-    polys_gdf = gpd.read_file(shp_path)
-    polys_gdf["Polygon_ID"] = polys_gdf.index
     
     # Find all LAS files for this location
     las_folder = BASE_LAS_PATH / location_name / 'noveg'
@@ -324,45 +379,46 @@ def process_location(location_name, polygon_name, start_mop, end_mop, overwrite=
     
     print(f"Found {len(las_files)} LAS files to process")
     
-    # Process each LAS file
-    for file_idx, las_file in enumerate(las_files, 1):
-        # Extract date from filename
-        date_match = re.match(r'^\d{8}', las_file.stem)
-        date_str = date_match.group() if date_match else 'unknown'
-        
-        print(f"\n{'='*70}")
-        print(f"File {file_idx}/{len(las_files)}: {las_file.name}")
-        print(f"{'='*70}")
-        
-        try:
-            # Create output paths
-            output_folder = OUTPUT_BASE_PATH / location_name / polygon_name
-            output_folder.mkdir(parents=True, exist_ok=True)
-            
-            pathout_slope = output_folder / f"{date_str}_{polygon_name}_slopes.csv"
-            fig_file = output_folder / f"{date_str}_{polygon_name}_slopes.png"
-            
-            # Process the file
-            df_results = makeGrid_with_slope(
-                pathin=las_file,
-                pathout_slope=pathout_slope,
-                polys=shp_path,
-                vertical_bin_size=VERTICAL_BIN_SIZE,
-                max_height=MAX_HEIGHT,
-                window_size=WINDOW_SIZE,
-                overwrite=overwrite
-            )
-            
-            # Create visualization if we got results
-            if df_results is not None and len(df_results) > 0:
-                create_slope_visualization(df_results, polys_gdf, fig_file, 
-                                         location_name, date_str)
-        
-        except Exception as e:
-            warnings.warn(f"Error processing file {las_file.name}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
+    # Prepare arguments for multiprocessing
+    args_list = [(las_file, shp_path, location_name, polygon_name, overwrite) 
+                 for las_file in las_files]
+    
+    # Process files in parallel
+    start_time = time.time()
+    
+    with Pool(processes=N_PROCESSES) as pool:
+        # Use imap for progress tracking
+        results = list(tqdm(
+            pool.imap(process_single_file, args_list),
+            total=len(args_list),
+            desc=f"Processing {location_name} files"
+        ))
+    
+    end_time = time.time()
+    processing_time = end_time - start_time
+    
+    # Summarize results
+    successful = [r for r in results if r[0]]
+    failed = [r for r in results if not r[0]]
+    
+    print(f"\n{'='*70}")
+    print(f"LOCATION PROCESSING COMPLETE: {location_name}")
+    print(f"{'='*70}")
+    print(f"Total processing time: {processing_time:.1f} seconds")
+    print(f"Average time per file: {processing_time/len(las_files):.1f} seconds")
+    print(f"Successfully processed: {len(successful)}/{len(las_files)} files")
+    
+    if failed:
+        print(f"\nFailed files ({len(failed)}):")
+        for success, filename, message in failed:
+            print(f"  ❌ {filename}: {message}")
+    
+    if successful:
+        print(f"\nSuccessful files ({len(successful)}):")
+        for success, filename, message in successful[:5]:  # Show first 5
+            print(f"  ✅ {filename}: {message}")
+        if len(successful) > 5:
+            print(f"  ... and {len(successful) - 5} more")
     
     print(f"\nCompleted processing for {location_name} - {polygon_name}")
 
@@ -505,13 +561,23 @@ def main():
     print(f"Vertical bin size: {VERTICAL_BIN_SIZE} m")
     print(f"Moving window size: {WINDOW_SIZE} bins")
     print(f"Minimum points per bin: {MIN_POINTS_PER_BIN}")
+    print(f"CPU cores available: {N_CORES}")
+    print(f"Processes to use: {N_PROCESSES} (cores // 4)")
+    
+    overall_start_time = time.time()
     
     # Process each location
     for location_name, polygon_name, start_mop, end_mop in LOCATIONS:
         process_location(location_name, polygon_name, start_mop, end_mop, overwrite=False)
     
+    overall_end_time = time.time()
+    total_time = overall_end_time - overall_start_time
+    
     print("\n" + "="*70)
-    print("All locations processed!")
+    print("ALL LOCATIONS PROCESSED!")
+    print("="*70)
+    print(f"Total processing time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
+    print(f"Processed {len(LOCATIONS)} locations using {N_PROCESSES} parallel processes")
     print("="*70)
 
 
